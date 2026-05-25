@@ -459,9 +459,21 @@ with st.sidebar:
 # ═══════════════════════════════════════════════
 
 def filter_date(df, start, end):
-    """Filter dataframe by date range."""
-    mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
-    return df[mask]
+    """Filter dataframe by date range. Handles both DatetimeIndex and non-datetime indexes."""
+    if df.empty:
+        return df
+    try:
+        # Ensure index is datetime
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df = df.copy()
+            df.index = pd.to_datetime(df.index, errors="coerce")
+            df = df[df.index.notna()]
+        if df.empty:
+            return df
+        mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
+        return df[mask]
+    except Exception:
+        return df
 
 
 def metric_card(label, value, delta=None, unit=""):
@@ -667,7 +679,33 @@ with tab2:
 
             if curve_metal in curve_data and "prices" in curve_data[curve_metal]:
                 prices_df = curve_data[curve_metal]["prices"]
+                
+                # Ensure prices_df has a valid DatetimeIndex
+                if not prices_df.empty:
+                    if not isinstance(prices_df.index, pd.DatetimeIndex):
+                        # Try getting index from the raw data
+                        raw_df = curve_data[curve_metal].get("raw", pd.DataFrame())
+                        if isinstance(raw_df.index, pd.DatetimeIndex):
+                            prices_df.index = raw_df.index[:len(prices_df)]
+                        else:
+                            try:
+                                prices_df.index = pd.to_datetime(prices_df.index, errors="coerce")
+                                prices_df = prices_df[prices_df.index.notna()]
+                            except Exception:
+                                st.warning("Could not parse dates from futures curve data.")
+                                prices_df = pd.DataFrame()
+                
                 prices_df = filter_date(prices_df, start_date, end_date)
+
+                # Debug: show parsed columns
+                with st.expander("🔍 Debug: Parsed Data Info", expanded=False):
+                    raw_cols = list(curve_data[curve_metal].get("raw", pd.DataFrame()).columns[:20])
+                    st.write(f"**Raw columns (first 20):** {raw_cols}")
+                    st.write(f"**Parsed price columns:** {list(prices_df.columns)}")
+                    st.write(f"**Index type:** {type(prices_df.index).__name__}")
+                    st.write(f"**Shape:** {prices_df.shape}")
+                    if not prices_df.empty:
+                        st.write(f"**Date range:** {prices_df.index.min()} → {prices_df.index.max()}")
 
                 if not prices_df.empty and not prices_df.columns.empty:
                     # Date slider
