@@ -220,78 +220,144 @@ def load_cash_3m_data(file):
 
 @st.cache_data(ttl=3600)
 def load_futures_curve_data(file):
-    """Load Metals Futures Curve — one sheet per metal with F1-F27."""
-    # Detect file type
+    """
+    Load Metals Futures Curve — one sheet per metal with F1-F27.
+    Handles: .xlsx, .xls, .csv (with encoding fallbacks), and
+    xlsx files incorrectly saved with .csv extension.
+    """
     fname = file.name if hasattr(file, 'name') else str(file)
-    if fname.endswith('.csv'):
-        # Single CSV — need to figure out structure
-        df = pd.read_csv(file)
-        return {"raw_csv": df}
+    data = {}
 
-    xls = pd.ExcelFile(file)
+    # ── Try reading as Excel first (even if extension is .csv) ──
+    try:
+        xls = pd.ExcelFile(file)
+        return _parse_curve_excel(xls)
+    except Exception:
+        pass
+
+    # ── If Excel fails, try CSV with multiple encodings ──
+    if fname.lower().endswith('.csv'):
+        for encoding in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16']:
+            try:
+                file.seek(0)  # Reset file pointer
+                df = pd.read_csv(file, encoding=encoding)
+                if not df.empty:
+                    data["Sheet1"] = _parse_single_curve_df(df)
+                    return data
+            except Exception:
+                continue
+
+        # Last resort: read as bytes, decode, then parse
+        try:
+            file.seek(0)
+            raw = file.read()
+            # Try to detect if it's actually xlsx bytes
+            if raw[:4] == b'PK\x03\x04':  # ZIP/XLSX magic bytes
+                import io
+                file.seek(0)
+                xls = pd.ExcelFile(io.BytesIO(raw))
+                return _parse_curve_excel(xls)
+            # Otherwise try as text
+            for enc in ['utf-8', 'latin-1', 'cp1252']:
+                try:
+                    text = raw.decode(enc)
+                    import io
+                    df = pd.read_csv(io.StringIO(text))
+                    if not df.empty:
+                        data["Sheet1"] = _parse_single_curve_df(df)
+                        return data
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    st.error(f"Could not read '{fname}'. Try saving it as .xlsx from Excel and re-uploading.")
+    return data
+
+
+def _parse_curve_excel(xls):
+    """Parse an Excel file with one sheet per metal, multi-row headers."""
     data = {}
 
     for sheet in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name=sheet, header=[0, 1, 2] if True else [0, 1])
-        
-        # Try multi-level header (Row 1: blank, Row 2: F1/F2/.., Row 3: Price/Volume/OI)
         try:
-            # Read with first 3 rows as potential headers
-            df = pd.read_excel(xls, sheet_name=sheet)
+            # First pass: read raw to detect header structure
+            df_raw = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=5)
 
-            # Find where data starts — look for "Date" in first few rows
-            date_row = None
-            for i in range(5):
-                row_vals = [str(v).strip().lower() for v in df.iloc[i].values if pd.notna(v)]
-                if "date" in row_vals or any("price" in v for v in row_vals):
-                    date_row = i
-                    break
+            # Detect header rows by looking for "Date", "F1", "Price" etc.
+            header_rows = []
+            for i in range(min(4, len(df_raw))):
+                row_vals = [str(v).strip().lower() for v in df_raw.iloc[i].values if pd.notna(v)]
+                if any(kw in " ".join(row_vals) for kw in ["date", "f1", "f2", "price", "volume"]):
+                    header_rows.append(i)
 
-            # Re-read with proper header
-            if date_row is not None and date_row > 0:
-                df = pd.read_excel(xls, sheet_name=sheet, header=list(range(date_row + 1)))
+            # Read with detected headers
+            if len(header_rows) >= 2:
+                df = pd.read_excel(xls, sheet_name=sheet, header=header_rows)
+            elif len(header_rows) == 1:
+                df = pd.read_excel(xls, sheet_name=sheet, header=header_rows[0])
             else:
+                # Default: try first 3 rows as header (matches your screenshot: Row1=blank, Row2=F1/F2, Row3=Price/Vol/OI)
                 df = pd.read_excel(xls, sheet_name=sheet, header=[0, 1, 2])
+
         except Exception:
-            df = pd.read_excel(xls, sheet_name=sheet, header=[0, 1])
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet, header=[0, 1])
+            except Exception:
+                df = pd.read_excel(xls, sheet_name=sheet)
 
-        # Flatten columns
-        if isinstance(df.columns, pd.MultiIndex):
-            new_cols = []
-            for col_tuple in df.columns:
-                parts = [str(p).strip() for p in col_tuple if "Unnamed" not in str(p) and str(p).strip()]
-                new_cols.append("_".join(parts) if parts else str(col_tuple))
-            df.columns = new_cols
-
-        # Find and set date index
-        date_col = [c for c in df.columns if "date" in c.lower()]
-        if date_col:
-            df = df.rename(columns={date_col[0]: "Date"})
-        if "Date" in df.columns:
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"])
-            df = df.set_index("Date").sort_index()
-
-        # Extract price columns for each future month
-        prices = {}
-        for col in df.columns:
-            col_lower = col.lower()
-            # Match patterns like "F1_Price", "F1 Price", etc.
-            for i in range(1, 28):
-                if (f"f{i}_price" in col_lower or f"f{i} price" in col_lower or
-                    (f"f{i}" in col_lower and "price" in col_lower)):
-                    prices[f"F{i}"] = df[col]
-                    break
-
-        if prices:
-            data[sheet] = {
-                "raw": df,
-                "prices": pd.DataFrame(prices, index=df.index)
-            }
-        else:
-            data[sheet] = {"raw": df, "prices": pd.DataFrame()}
+        data[sheet] = _parse_single_curve_df(df)
 
     return data
+
+
+def _parse_single_curve_df(df):
+    """Parse a single dataframe with futures curve data into standardized format."""
+    # Flatten multi-level columns
+    if isinstance(df.columns, pd.MultiIndex):
+        new_cols = []
+        for col_tuple in df.columns:
+            parts = [str(p).strip() for p in col_tuple
+                     if pd.notna(p) and "Unnamed" not in str(p) and str(p).strip()]
+            new_cols.append("_".join(parts) if parts else str(col_tuple))
+        df.columns = new_cols
+
+    # Clean column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Find and set date index
+    date_col = [c for c in df.columns if "date" in c.lower()]
+    if date_col:
+        df = df.rename(columns={date_col[0]: "Date"})
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"])
+        df = df.set_index("Date").sort_index()
+
+    # Extract price columns for each future month
+    # Match patterns: "F1_Price", "F1 Price", "F1_price", or just columns containing "F1" and "price"
+    prices = {}
+    for col in df.columns:
+        col_lower = col.lower().replace(" ", "_")
+        for i in range(1, 28):
+            patterns = [
+                f"f{i}_price", f"f{i}_Price",
+                f"F{i}_Price", f"F{i}_price",
+            ]
+            # Also match "F1" at start with "price" somewhere
+            if any(p.lower() in col_lower for p in patterns):
+                prices[f"F{i}"] = pd.to_numeric(df[col], errors="coerce")
+                break
+            # Fallback: column starts with F{i} and contains "price"
+            elif col_lower.startswith(f"f{i}") and "price" in col_lower:
+                prices[f"F{i}"] = pd.to_numeric(df[col], errors="coerce")
+                break
+
+    result = {
+        "raw": df,
+        "prices": pd.DataFrame(prices, index=df.index) if prices else pd.DataFrame()
+    }
+    return result
 
 
 def parse_cash_3m_columns(df, metal_name):
@@ -344,7 +410,7 @@ with st.sidebar:
     # File uploads
     st.markdown("##### 📂 Data Files")
     cash_file = st.file_uploader("Metals Cash and 3M", type=["xlsx", "xls"], key="cash")
-    curve_file = st.file_uploader("Metals Futures Curve", type=["xlsx", "xls", "csv"], key="curve")
+    curve_file = st.file_uploader("Metals Futures Curve", type=["xlsx", "xls", "csv", "xlsm"], key="curve")
 
     st.divider()
 
